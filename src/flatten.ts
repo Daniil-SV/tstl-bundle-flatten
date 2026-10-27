@@ -17,20 +17,33 @@ const MODULE = /\["([^"]+)"\] = function\([^)]*\)\s*\n([\s\S]*?)\n end,/dg;
 
 const EXPORTS_TABLE = "local ____exports = {}";
 const REQUIRE_LINE = /^[ \t]*(?:local ____\w+ = )?require\("[^"]+"\)$/;
-const IMPORT_LINE = /^([ \t]*)local (\w+) = ____\w+\.(\w+)$/;
+const IMPORT_LINE = /^([ \t]*)local (\w+) = (____\w+)\.(\w+)$/;
 const NAMESPACE_REQUIRE = /^[ \t]*local \w+ = require\("([^"]+)"\)$/;
 const INDENT = /^ {4}/;
 const RETURN_EXPORTS = /(?:^|\n)return (?:____exports|\{[^}]*\})$/;
 
+function sanitizeModuleName(name: string): string {
+  return name.replace(/[^A-Za-z0-9_]/g, "_");
+}
+
 /** Rewrites the ____exports table away, one line at a time. */
-function stripExports(lines: Line[]): Line[] {
-  const rewritten = lines.map((line) => ({
-    ...line,
-    text: line.text
+function stripExports(lines: Line[], defaultAlias: string | null): Line[] {
+  const rewritten = lines.map((line) => {
+    let text = line.text;
+
+    if (defaultAlias !== null) {
+      text = text.replace(/function ____exports\.default(\s*\()/g, `local function ${defaultAlias}$1`);
+      text = text.replace(/____exports\.default\s*=\s*([^\n]*)/g, (_m, rhs) => `local ${defaultAlias} = ${rhs}`);
+      text = text.replace(/____exports\.default\b/g, defaultAlias);
+    }
+
+    text = text
       .replace(/function ____exports\.(\w+)\s*\(/g, "local function $1(")
       .replace(/____exports\.(\w+)\s*=/g, "local $1 =")
-      .replace(/____exports\./g, ""),
-  }));
+      .replace(/____exports\./g, "");
+
+    return { ...line, text };
+  });
 
   // Only the first declaration goes, matching the original single replace.
   const index = rewritten.findIndex((line) => line.text.endsWith(EXPORTS_TABLE));
@@ -61,8 +74,12 @@ function stripReturn(lines: Line[]): Line[] {
 }
 
 /** Drops require() calls and resolves the destructuring that follows them. */
-function stripImports(lines: Line[]): Line[] {
+function stripImports(lines: Line[], defaultAliases: Map<string, string | null>): Line[] {
   const result: Line[] = [];
+
+  // Maps a `____foo` require alias to the module path it came from, so an
+  // import of a default export can be pointed at that module's unique alias.
+  const requireMap = new Map<string, string>();
 
   for (let index = 0; index < lines.length; index++) {
     const line = lines[index];
@@ -73,7 +90,7 @@ function stripImports(lines: Line[]): Line[] {
       const close = lines.findIndex((other, at) => at > index && other.text === "end");
 
       if (close !== -1 && lines.slice(index + 1, close).some((other) => REQUIRE_LINE.test(other.text))) {
-        for (const unwrapped of stripImports(lines.slice(index + 1, close))) {
+        for (const unwrapped of stripImports(lines.slice(index + 1, close), defaultAliases)) {
           result.push({ ...unwrapped, text: unwrapped.text.replace(INDENT, "") });
         }
 
@@ -81,6 +98,12 @@ function stripImports(lines: Line[]): Line[] {
 
         continue;
       }
+    }
+
+    const requireMatch = line.text.match(/^([ \t]*)local (____\w+) = require\("([^"]+)"\)$/);
+    if (requireMatch) {
+      requireMap.set(requireMatch[2], requireMatch[3]);
+      continue;
     }
 
     if (REQUIRE_LINE.test(line.text)) continue;
@@ -93,7 +116,20 @@ function stripImports(lines: Line[]): Line[] {
       continue;
     }
 
-    const [, indent, localName, exportName] = match;
+    const [, indent, localName, requireVar, exportName] = match;
+
+    if (exportName === "default") {
+      const modulePath = requireMap.get(requireVar);
+      const alias = modulePath !== undefined ? defaultAliases.get(modulePath) : undefined;
+
+      if (alias) {
+        if (localName === alias) continue;
+
+        result.push({ ...line, text: `${indent}local ${localName} = ${alias}` });
+
+        continue;
+      }
+    }
 
     // Same name means the earlier module already put it in scope.
     if (localName === exportName) continue;
@@ -157,6 +193,14 @@ function trimLines(lines: Line[]): Line[] {
   return trimmed;
 }
 
+function computeDefaultAlias(moduleName: string, lines: Line[]): string | null {
+  const text = render(lines);
+
+  if (!/____exports\.default\b/.test(text)) return null;
+
+  return `____default_${sanitizeModuleName(moduleName)}`;
+}
+
 export function flattenLines(lines: Line[], skipModules: string[]): Line[] {
   const code = render(lines);
   const runtimeStart = code.indexOf("\nlocal ____modules = {}\n");
@@ -166,7 +210,7 @@ export function flattenLines(lines: Line[], skipModules: string[]): Line[] {
   // Everything before the module table is kept verbatim.
   const header = code.slice(0, runtimeStart + 1);
   const headerLineCount = header.split("\n").length - 1;
-  const bodies: Line[][] = [];
+  const moduleEntries: { name: string; bodyLines: Line[] }[] = [];
 
   MODULE.lastIndex = 0;
 
@@ -178,7 +222,26 @@ export function flattenLines(lines: Line[], skipModules: string[]): Line[] {
     const bodyStart = match.indices![2][0];
     const firstLine = code.slice(0, bodyStart).split("\n").length - 1;
     const bodyLines = lines.slice(firstLine, firstLine + match[2].split("\n").length);
-    const body = trimLines(stripEmptyScopes(stripImports(stripReturn(stripExports(bodyLines)))));
+
+    moduleEntries.push({ name: match[1], bodyLines });
+  }
+
+  // Compute each module's unique default-export alias before transforming, so
+  // imports can be pointed at the right declaration regardless of order.
+  const defaultAliases = new Map<string, string | null>();
+
+  for (const entry of moduleEntries) {
+    defaultAliases.set(entry.name, computeDefaultAlias(entry.name, entry.bodyLines));
+  }
+
+  const bodies: Line[][] = [];
+
+  for (const entry of moduleEntries) {
+    const alias = defaultAliases.get(entry.name) ?? null;
+
+    const body = trimLines(
+      stripEmptyScopes(stripImports(stripReturn(stripExports(entry.bodyLines, alias)), defaultAliases)),
+    );
 
     // An emptied-out module still contributes its separator, as it did when
     // this worked on strings and pushed "" into the joined list.
