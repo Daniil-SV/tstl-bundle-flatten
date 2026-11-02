@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import plugin from "./index";
+import { createPlugin } from "./index";
 import { decodeMappings, encodeMappings, remapSourceMap } from "./sourcemap";
 
 function map(mappings: string, extra: Record<string, unknown> = {}) {
@@ -97,10 +97,16 @@ describe("the afterEmit hook", () => {
   function emit(options: { sourceMap?: boolean }) {
     const written: Record<string, string> = {};
     const file = { outputPath: "out/bundle.lua", code: BUNDLE, sourceMap: '{"version":3,"mappings":"AAAA;AACA"}' };
+    const afterEmit = createPlugin().afterEmit;
 
-    plugin.afterEmit(undefined, options, { writeFile: (path: string, code: string) => void (written[path] = code) }, [
-      file,
-    ]);
+    if (!afterEmit) throw new Error("afterEmit hook is missing");
+
+    afterEmit(
+      undefined as never,
+      options as never,
+      { writeFile: (path: string, code: string) => void (written[path] = code) } as never,
+      [file] as never,
+    );
 
     return written;
   }

@@ -1,7 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { flattenBundle } from "./flatten";
 import { formatLua } from "./format";
-import { shakeBundle } from "./shake";
 
 /**
  * Builds a realistic TSTL luaBundle string matching the actual
@@ -69,8 +68,13 @@ return ____exports`,
     expect(flattenBundle(code, [])).toMatchInlineSnapshot(`
 "--[[ Generated with https://github.com/TypeScriptToLua/TypeScriptToLua ]]
 
+do
+local function ____module_0()
 local CHANNEL = -1731704569
 local TIMEOUT = 30
+end
+____module_0()
+end
 "
 `);
   });
@@ -110,7 +114,10 @@ return ____exports`,
     const flattened = flattenBundle(code, []);
 
     expect(flattened).toContain("\nlocal alias = value\n");
-    expect(flattened).not.toContain("do");
+    // The forwarding spare line is dropped, and the require it would have read
+    // from is gone, so nothing may still name either.
+    expect(flattened).not.toContain("____exports");
+    expect(flattened).not.toContain("____first");
   });
 
   test("refuses a namespace import, which has no object left to name", () => {
@@ -166,14 +173,25 @@ print(add(1, multiply(2, 3)))`,
     expect(flattenBundle(code, [])).toMatchInlineSnapshot(`
 "--[[ Generated with https://github.com/TypeScriptToLua/TypeScriptToLua ]]
 
-local function add(a, b)
+local add, multiply
+do
+local function ____module_0()
+function add(a, b)
     return a + b
 end
-local function multiply(a, b)
+function multiply(a, b)
     return a * b
 end
+end
+____module_0()
+end
 
+do
+local function ____module_1()
 print(add(1, multiply(2, 3)))
+end
+____module_1()
+end
 "
 `);
   });
@@ -202,12 +220,23 @@ makeNew()`,
     expect(flattenBundle(code, [])).toMatchInlineSnapshot(`
 "--[[ Generated with https://github.com/TypeScriptToLua/TypeScriptToLua ]]
 
-local function create()
+local create
+do
+local function ____module_0()
+function create()
     return {}
 end
+end
+____module_0()
+end
 
+do
+local function ____module_1()
 local makeNew = create
 makeNew()
+end
+____module_1()
+end
 "
 `);
   });
@@ -241,8 +270,13 @@ __TS__ArrayPush(list, "hello")`,
     expect(flattenBundle(code, ["lualib_bundle"])).toMatchInlineSnapshot(`
 "--[[ Generated with https://github.com/TypeScriptToLua/TypeScriptToLua ]]
 
+do
+local function ____module_0()
 local list = {}
 __TS__ArrayPush(list, "hello")
+end
+____module_0()
+end
 "
 `);
   });
@@ -267,10 +301,15 @@ return ____exports`,
     expect(flattenBundle(code, [])).toMatchInlineSnapshot(`
 "--[[ Generated with https://github.com/TypeScriptToLua/TypeScriptToLua ]]
 
+do
+local function ____module_0()
 local DEFAULT_TIMEOUT = 30
 local MAX_RETRIES = 3
 local function getConfig()
     return {timeout = DEFAULT_TIMEOUT, retries = MAX_RETRIES}
+end
+end
+____module_0()
 end
 "
 `);
@@ -292,7 +331,12 @@ return {VERSION = ____exports.VERSION}`,
     expect(flattenBundle(code, [])).toMatchInlineSnapshot(`
 "--[[ Generated with https://github.com/TypeScriptToLua/TypeScriptToLua ]]
 
+do
+local function ____module_0()
 local VERSION = "1.0.0"
+end
+____module_0()
+end
 "
 `);
   });
@@ -328,13 +372,29 @@ return ____exports`,
     expect(flattenBundle(code, [])).toMatchInlineSnapshot(`
       "--[[ Generated with https://github.com/TypeScriptToLua/TypeScriptToLua ]]
 
-      local function create()
+      local create
+      do
+      local function ____module_0()
+      function create()
           return {}
       end
+      end
+      ____module_0()
+      end
 
+      do
+      local function ____module_1()
       local makeNew = create
+      end
+      ____module_1()
+      end
 
+      do
+      local function ____module_2()
       makeNew()
+      end
+      ____module_2()
+      end
       "
     `);
   });
@@ -368,11 +428,22 @@ print("hi")`,
     expect(flattenBundle(code, [])).toMatchInlineSnapshot(`
 "--[[ Generated with https://github.com/TypeScriptToLua/TypeScriptToLua ]]
 
-local function helper()
+local helper
+do
+local function ____module_0()
+function helper()
     return 1
 end
+end
+____module_0()
+end
 
+do
+local function ____module_1()
 print("hi")
+end
+____module_1()
+end
 "
 `);
   });
@@ -395,8 +466,13 @@ end`,
 "--[[ Generated with https://github.com/TypeScriptToLua/TypeScriptToLua ]]
 
 do
+local function ____module_0()
+do
     local x = 1
     print(x)
+end
+end
+____module_0()
 end
 "
 `);
@@ -443,15 +519,28 @@ ll.Listen(PRIVATE_CHANNEL, "", uuid.create(""), "")`,
     expect(transform(code)).toMatchInlineSnapshot(`
 "--[[ Generated with https://github.com/TypeScriptToLua/TypeScriptToLua ]]
 
-local PRIVATE_CHANNEL = -1731704569
+local PRIVATE_CHANNEL, sign
+
+do
+
+local function ____module_0()
+PRIVATE_CHANNEL = -1731704569
+
 local TIMEOUT = 30
 
-local function sign(payload)
+function sign(payload)
     local bucket = ll.GetUnixTime() // 2
 
     return string.sub(ll.MD5String(tostring(bucket) .. "|" .. payload, -1977872753), 1, 8) .. "|" .. payload
 end
+end
 
+____module_0()
+end
+
+do
+
+local function ____module_1()
 local owner = ll.GetOwner()
 
 local function onListen(channel, _name, id, text)
@@ -468,6 +557,11 @@ end
 
 LLEvents:on("listen", onListen)
 ll.Listen(PRIVATE_CHANNEL, "", uuid.create(""), "")
+end
+
+____module_1()
+end
+
 "
 `);
   });
@@ -515,10 +609,22 @@ LLEvents:on("timer", scan)`,
     expect(transform(code)).toMatchInlineSnapshot(`
 "--[[ Generated with https://github.com/TypeScriptToLua/TypeScriptToLua ]]
 
-local MAX_AGENTS = 100
-local SCAN_INTERVAL = 5.0
+local MAX_AGENTS, SCAN_INTERVAL, scan
 
-local function scan()
+do
+
+local function ____module_0()
+MAX_AGENTS = 100
+SCAN_INTERVAL = 5.0
+end
+
+____module_0()
+end
+
+do
+
+local function ____module_1()
+function scan()
     local agents = ll.GetAgentList(AGENT_LIST_REGION, {})
 
     if #agents > MAX_AGENTS then
@@ -529,9 +635,21 @@ local function scan()
         ll.RegionSayTo(agent, 0, "ping")
     end
 end
+end
 
+____module_1()
+end
+
+do
+
+local function ____module_2()
 ll.SetTimerEvent(SCAN_INTERVAL)
 LLEvents:on("timer", scan)
+end
+
+____module_2()
+end
+
 "
 `);
   });
@@ -564,195 +682,20 @@ end`,
     expect(transform(code, ["lualib_bundle"])).toMatchInlineSnapshot(`
 "--[[ Generated with https://github.com/TypeScriptToLua/TypeScriptToLua ]]
 
+do
+
+local function ____module_0()
 local message = "hello world"
 
 if __TS__StringIncludes(message, "hello") then
     print("found")
 end
+end
+
+____module_0()
+end
 
 "
 `);
-  });
-});
-
-describe("shakeBundle", () => {
-  test("removes unused local functions, keeping the live chain", () => {
-    const code = `local function used()
-    return 1
-end
-local function unused()
-    return 2
-end
-local function alsoUnused()
-    return unused()
-end
-print(used())
-`;
-
-    expect(shakeBundle(code)).toMatchInlineSnapshot(`
-      "local function used()
-          return 1
-      end
-      print(used())
-      "
-    `);
-  });
-
-  test("preserves side effects when removing an unused local", () => {
-    const code = `local handle = ll.Listen(0, "", "", "")
-print("listening")
-`;
-
-    expect(shakeBundle(code)).toMatchInlineSnapshot(`
-      "ll.Listen(0, "", "", "")
-      print("listening")
-      "
-    `);
-  });
-
-  test("keeps aliased functions used through the alias", () => {
-    const code = `local function yieldFetch(url)
-    return url
-end
-local fetch = yieldFetch
-print(fetch("https://example.com"))
-`;
-
-    expect(shakeBundle(code)).toMatchInlineSnapshot(`
-      "local function yieldFetch(url)
-          return url
-      end
-      local fetch = yieldFetch
-      print(fetch("https://example.com"))
-      "
-    `);
-  });
-
-  test("keeps the parentheses around an if-expression operand", () => {
-    // An if-expression's `else` branch runs as far right as it can, so it binds looser than
-    // every binary operator. These parentheses must survive darklua's parse and print.
-    const code = `local ok = n > 0
-print((if ok then "A" else "B") .. " tail")
-print(s .. (if ok then "A" else "B") .. " tail")
-print((if ok then 1 else 2) + n, n - (if ok then 1 else 2) * 3)
-print((if ok then 1 else 2) ^ n, -(if ok then 1 else 2))
-print((if ok then 1 else 2) < n, (if ok then 1 else 2) == n)
-print((if ok then s else nil) or "B", (if ok then n else nil) and n > 1)
-print(not (if ok then n else nil))
-print((if ok then (if n > 1 then "big" else "one") else "none") .. "!")
-print((if ok then 1 else if n > 1 then 2 else 3) + n)
-print((if ok then f else g)("z"), (if ok then t else u).field)
-`;
-
-    expect(shakeBundle(code)).toBe(code);
-  });
-});
-
-describe("full pipeline (flatten + shake + format)", () => {
-  function transformShaken(code: string, skipModules: string[] = []) {
-    return formatLua(shakeBundle(flattenBundle(code, skipModules)));
-  }
-
-  test("drops vendored exports the entry never uses", () => {
-    // Mirrors the vendored-modules case: utilities exports three helpers
-    // through a barrel, the entry imports only one. The unused function
-    // bodies must not survive.
-    const code = tstlBundle(
-      [
-        [
-          "src/modules/utilities",
-          `local ____exports = {}
-function ____exports.cooldown(fn, seconds)
-    local ready = true
-    return function(...)
-        if ready then
-            ready = false
-            fn(...)
-        end
-    end
-end
-function ____exports.debounce(fn, seconds)
-    return function(...)
-        fn(...)
-    end
-end
-function ____exports.throttle(fn, seconds)
-    return function(...)
-        fn(...)
-    end
-end
-return ____exports`,
-        ],
-        [
-          "src/main",
-          `local ____utilities = require("src/modules/utilities")
-local cooldown = ____utilities.cooldown
-local greet = cooldown(function(id)
-    ll.Say(0, "hello " .. id)
-end, 5)
-LLEvents:on("touch_start", greet)`,
-        ],
-      ],
-      "src/main",
-    );
-
-    const output = transformShaken(code);
-
-    expect(output).toContain("cooldown");
-    expect(output).not.toContain("debounce");
-    expect(output).not.toContain("throttle");
-    expect(output).toMatchInlineSnapshot(`
-      "--[[ Generated with https://github.com/TypeScriptToLua/TypeScriptToLua ]]
-
-      local function cooldown(fn, seconds)
-          local ready = true
-
-          return function(...)
-              if ready then
-                  ready = false
-                  fn(...)
-              end
-          end
-      end
-
-      local greet = cooldown(function(id)
-          ll.Say(0, "hello " .. id)
-      end, 5)
-      LLEvents:on("touch_start", greet)
-      "
-    `);
-  });
-
-  test("keeps the parentheses that end an if-expression in a template literal", () => {
-    // TypeScriptToLua 1.37.1's Luau output for:
-    //   print(`Result: ${ok ? "PASS" : "FAIL"}; n=${n}`);
-    //   print(`x${ok ? `${n}!` : "none"}y`);
-    //   print(`a${ok ? "x" : n > 1 ? "y" : "z"}b${n}`);
-    // The group a template literal nests into is what ends each if-expression.
-    const code = tstlBundle(
-      [
-        [
-          "src/main",
-          `local ____exports = {}
-local n = ll.GetUnixTime() % 3
-local ok = n > 0
-print((("Result: " .. if ok then "PASS" else "FAIL") .. "; n=") .. tostring(n))
-print(("x" .. if ok then tostring(n) .. "!" else "none") .. "y")
-print((("a" .. if ok then "x" else if n > 1 then "y" else "z") .. "b") .. tostring(n))
-return ____exports`,
-        ],
-      ],
-      "src/main",
-    );
-
-    const prints = transformShaken(code)
-      .split("\n")
-      .filter((line) => line.startsWith("print"));
-
-    expect(prints).toEqual([
-      `print(("Result: " .. if ok then "PASS" else "FAIL") .. "; n=" .. tostring(n))`,
-      `print(("x" .. if ok then tostring(n) .. "!" else "none") .. "y")`,
-      `print(("a" .. if ok then "x" else if n > 1 then "y" else "z") .. "b" .. tostring(n))`,
-    ]);
   });
 });

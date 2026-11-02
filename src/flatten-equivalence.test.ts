@@ -130,11 +130,16 @@ print(area(nil, 2))`,
   ["src/no-exports", `print("just a side effect")`],
 ];
 
+/** The pre-scoping emission, which this file treats as the reference oracle. */
+function legacy(code: string, skipModules: string[] = []): string {
+  return flattenBundle(code, { skipModules, scopeModules: false });
+}
+
 describe("flattenLines", () => {
   test("passes through code that is not a bundle", () => {
     const code = `--[[ Generated ]]\nprint("hello")\n`;
 
-    expect(flattenBundle(code, [])).toBe(referenceFlatten(code, []));
+    expect(legacy(code)).toBe(referenceFlatten(code, []));
   });
 
   for (const [name] of MODULES) {
@@ -144,25 +149,25 @@ describe("flattenLines", () => {
         name,
       );
 
-      expect(flattenBundle(code, [])).toBe(referenceFlatten(code, []));
+      expect(legacy(code)).toBe(referenceFlatten(code, []));
     });
   }
 
   test("matches the original flattener on the full bundle", () => {
     const code = bundle(MODULES, "src/main");
 
-    expect(flattenBundle(code, [])).toBe(referenceFlatten(code, []));
+    expect(legacy(code)).toBe(referenceFlatten(code, []));
   });
 
   test("matches the original flattener for every skipModules choice", () => {
     const code = bundle(MODULES, "src/main");
 
     for (const [name] of MODULES) {
-      expect(flattenBundle(code, [name])).toBe(referenceFlatten(code, [name]));
+      expect(legacy(code, [name])).toBe(referenceFlatten(code, [name]));
     }
 
     expect(
-      flattenBundle(
+      legacy(
         code,
         MODULES.map(([name]) => name),
       ),
@@ -179,7 +184,7 @@ describe("flattenLines", () => {
       for (let j = 0; j < MODULES.length; j++) {
         const code = bundle([MODULES[i], MODULES[j]], MODULES[j][0]);
 
-        expect(flattenBundle(code, [])).toBe(referenceFlatten(code, []));
+        expect(legacy(code)).toBe(referenceFlatten(code, []));
       }
     }
   });

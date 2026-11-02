@@ -3,7 +3,6 @@ import { flattenBundle } from "./flatten";
 import { formatLua } from "./format";
 import { transformLines } from "./index";
 import { render } from "./lines";
-import { shakeBundle } from "./shake";
 
 /** The pipeline as it ran before line tracking, composed from the string APIs. */
 function referencePipeline(
@@ -11,16 +10,13 @@ function referencePipeline(
   {
     skipModules = [],
     format = true,
-    shake = false,
   }: {
     skipModules?: string[];
     format?: boolean;
-    shake?: boolean;
   },
 ) {
-  let output = flattenBundle(code, skipModules);
+  let output = flattenBundle(code, { skipModules, scopeModules: false });
 
-  if (shake) output = shakeBundle(output);
   if (format) output = formatLua(output);
 
   return output;
@@ -79,11 +75,9 @@ const NOT_A_BUNDLE = `--[[ Generated ]]\nprint("hello")\n`;
 const OPTIONS = [
   {},
   { format: false },
-  { shake: true },
-  { shake: true, format: false },
   { skipModules: ["src/constants"] },
   { skipModules: ["src/constants", "src/math", "src/main"] },
-];
+].map((options) => ({ ...options, scopeModules: false }));
 
 describe("transformLines", () => {
   for (const options of OPTIONS) {
@@ -97,7 +91,7 @@ describe("transformLines", () => {
   }
 
   test("produces one map entry per output line", () => {
-    const lines = transformLines(BUNDLE, { shake: true });
+    const lines = transformLines(BUNDLE, {});
 
     expect(lines).toHaveLength(render(lines).split("\n").length);
   });
