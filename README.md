@@ -185,7 +185,8 @@ Class methods are kept by default because they can be reached dynamically.
 Set `"shakeClassFunctions": true` to remove methods and accessors that are never
 referenced. This relies on the type checker, so reflection-style access such as
 `obj["method"]()` or passing an instance through `any` can hide a use. Leave it
-off when a class is used that way.
+off when a class is used that way. Computed names (such as `[Symbol.iterator]`)
+and implicit Lua hooks (such as `toString`/`__tostring`) are always kept.
 
 Namespaces are left intact because their bodies are emitted as a whole.
 

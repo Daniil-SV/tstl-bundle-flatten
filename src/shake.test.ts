@@ -423,6 +423,23 @@ print(widget.used);
     expect(lua).not.toContain("unused");
   });
 
+  test("keeps variables read by shorthand object properties", () => {
+    const source = `
+function makeValue() { return "value"; }
+function run() {
+  const result = makeValue();
+  return { result };
+}
+print(run().result);
+`;
+    const lua = luaOf(transpile({ "main.ts": source }, { shake: true }));
+
+    // `{ result }` reads the local, so the initializer and the helper it calls
+    // have to survive even though nothing spells out `result` as an access.
+    expect(lua).toContain("local result = makeValue");
+    expect(lua).toContain("{result = result}");
+  });
+
   test("keeps methods with computed property names", () => {
     const source = `
 const key = "compute";
@@ -440,6 +457,21 @@ print(w.used());
     // The [key]() method should be preserved — computed names can't be
     // statically resolved, so it's never safe to remove them.
     expect(lua).toContain("compute");
+    expect(lua).not.toContain("unused");
+  });
+
+  test("keeps toString because Lua calls it implicitly", () => {
+    const source = `
+class Widget {
+  toString() { return "widget"; }
+  unused() { return 42; }
+}
+const widget = new Widget();
+print("value: " + widget);
+`;
+    const lua = luaOf(transpile({ "main.ts": source }, { shake: true, shakeClassFunctions: true }));
+
+    expect(lua).toContain("__tostring");
     expect(lua).not.toContain("unused");
   });
 

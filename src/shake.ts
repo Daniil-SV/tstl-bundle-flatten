@@ -152,6 +152,10 @@ function collectClassMembers(node: ts.ClassDeclaration, context: Context): void 
     // protocols (iteration, coercion, etc.) — so never track them for removal.
     if (ts.isComputedPropertyName(member.name)) continue;
 
+    // TSTL emits `toString` as Lua's `__tostring`, which string concatenation
+    // and `tostring` call without a property access the checker can see.
+    if (isImplicitClassMember(member)) continue;
+
     const unit = addUnit(member, context);
     unit.owner = node;
 
@@ -201,6 +205,11 @@ function isClassFunction(node: ts.ClassElement): node is ts.MethodDeclaration | 
     (ts.isMethodDeclaration(node) || ts.isGetAccessorDeclaration(node) || ts.isSetAccessorDeclaration(node)) &&
     !ts.isConstructorDeclaration(node)
   );
+}
+
+/** Members the Lua runtime may call without a visible property access. */
+function isImplicitClassMember(node: ts.MethodDeclaration | ts.AccessorDeclaration): boolean {
+  return ts.isIdentifier(node.name) && node.name.text === "toString";
 }
 
 // ---------------------------------------------------------------------------
@@ -255,7 +264,10 @@ function resolveSymbol(symbol: ts.Symbol | undefined, context: Context): ts.Symb
 }
 
 function markSymbol(node: ts.Node, context: Context): void {
-  const symbol = context.checker.getSymbolAtLocation(node);
+  markResolvedSymbol(context.checker.getSymbolAtLocation(node), context);
+}
+
+function markResolvedSymbol(symbol: ts.Symbol | undefined, context: Context): void {
   if (!symbol) return;
 
   context.usedSymbols.add(symbol);
@@ -321,7 +333,11 @@ function visitCode(node: ts.Node, context: Context, all: boolean): void {
   }
 
   if (ts.isShorthandPropertyAssignment(node)) {
-    markSymbol(node.name, context);
+    // The symbol at the shorthand's name is the object literal's property, not
+    // the variable it reads. Resolve the value symbol, or `{ name }` fails to
+    // keep `name` alive and the emitted object references an undeclared local.
+    const valueSymbol = context.checker.getShorthandAssignmentValueSymbol(node);
+    markResolvedSymbol(valueSymbol, context);
     if (node.objectAssignmentInitializer) visitCode(node.objectAssignmentInitializer, context, all);
     return;
   }
@@ -497,7 +513,12 @@ function visitClassLikeAll(node: ClassLike, context: Context, onlyLiveMembers = 
     if (isClassFunction(member)) {
       visitPropertyName(member.name, context);
 
-      if (!onlyLiveMembers || !context.shakeClassFunctions || ts.isComputedPropertyName(member.name)) {
+      if (
+        !onlyLiveMembers ||
+        !context.shakeClassFunctions ||
+        ts.isComputedPropertyName(member.name) ||
+        isImplicitClassMember(member)
+      ) {
         visitFunctionLike(member, context);
       } else if (hasDecorators(member)) {
         markLive(member, context);
