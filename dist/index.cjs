@@ -1347,6 +1347,8 @@ function collectClassMembers(node, context) {
       continue;
     if (ts2.isComputedPropertyName(member.name))
       continue;
+    if (isImplicitClassMember(member))
+      continue;
     const unit = addUnit(member, context);
     unit.owner = node;
     if (ts2.isGetAccessorDeclaration(member) || ts2.isSetAccessorDeclaration(member)) {
@@ -1383,6 +1385,9 @@ function unitOf(node, context) {
 }
 function isClassFunction(node) {
   return (ts2.isMethodDeclaration(node) || ts2.isGetAccessorDeclaration(node) || ts2.isSetAccessorDeclaration(node)) && !ts2.isConstructorDeclaration(node);
+}
+function isImplicitClassMember(node) {
+  return ts2.isIdentifier(node.name) && node.name.text === "toString";
 }
 function markLive(node, context) {
   if (!node)
@@ -1432,7 +1437,9 @@ function resolveSymbol(symbol, context) {
   }
 }
 function markSymbol(node, context) {
-  const symbol = context.checker.getSymbolAtLocation(node);
+  markResolvedSymbol(context.checker.getSymbolAtLocation(node), context);
+}
+function markResolvedSymbol(symbol, context) {
   if (!symbol)
     return;
   context.usedSymbols.add(symbol);
@@ -1480,7 +1487,8 @@ function visitCode(node, context, all) {
     return;
   }
   if (ts2.isShorthandPropertyAssignment(node)) {
-    markSymbol(node.name, context);
+    const valueSymbol = context.checker.getShorthandAssignmentValueSymbol(node);
+    markResolvedSymbol(valueSymbol, context);
     if (node.objectAssignmentInitializer)
       visitCode(node.objectAssignmentInitializer, context, all);
     return;
@@ -1635,7 +1643,7 @@ function visitClassLikeAll(node, context, onlyLiveMembers = false) {
     }
     if (isClassFunction(member)) {
       visitPropertyName(member.name, context);
-      if (!onlyLiveMembers || !context.shakeClassFunctions || ts2.isComputedPropertyName(member.name)) {
+      if (!onlyLiveMembers || !context.shakeClassFunctions || ts2.isComputedPropertyName(member.name) || isImplicitClassMember(member)) {
         visitFunctionLike(member, context);
       } else if (hasDecorators(member)) {
         markLive(member, context);
