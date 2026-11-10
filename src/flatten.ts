@@ -139,11 +139,15 @@ interface Analysis {
   raw: Line[];
   defaultAlias: string | null;
   imports: ImportRef[];
+  /** Modules this one requires, in the order the requires appear. */
+  dependencies: string[];
   /** Binding keys this module imports, by the name it binds them to. */
   importLocals: Map<string, string>;
   /** Export name -> binding key it simply re-exports. */
   forwards: Map<string, string>;
   exports: ExportedName[];
+  /** The module ends with a bare `return <value>` instead of `return ____exports`. */
+  rawReturn: boolean;
   topLocalCounts: Map<string, number>;
   topLocalLines: Map<string, string[]>;
 }
@@ -234,7 +238,7 @@ function exportTableNames(raw: Line[]): { name: string; localName: string }[] {
   for (const line of raw.slice(start + 1, end)) {
     const entry = EXPORT_TABLE_ENTRY.exec(line.text);
 
-    if (entry !== null) names.push({ name: entry[1], localName: entry[2] });
+    if (entry !== null && isLuaIdentifier(entry[2])) names.push({ name: entry[1], localName: entry[2] });
   }
 
   return names;
@@ -347,10 +351,42 @@ function trimLines(lines: Line[]): Line[] {
   return trimmed;
 }
 
+/** The last top-level `return` statement in a module body, if there is one. */
+function moduleReturnIndex(lines: Line[]): number {
+  for (let index = lines.length - 1; index >= 0; index--) {
+    if (/^return[ \t]/.test(lines[index].text)) return index;
+  }
+
+  return -1;
+}
+
+/**
+ * Whether a module's value comes from a bare `return`, which is how TSTL emits
+ * JSON modules. Those modules never declare `____exports`, so the return value
+ * is the module's default export.
+ *
+ * A `return { name = local, ... }` table (TSTL's lualib) is also a bare return
+ * but publishes named exports instead, so it is not a default export.
+ */
+function hasRawReturn(lines: Line[], exportNames: { name: string }[]): boolean {
+  const index = moduleReturnIndex(lines);
+
+  if (index === -1) return false;
+
+  // A module that touches `____exports` publishes through the exports table,
+  // even when its final statement is a table constructor mentioning it.
+  if (/\b____exports\b/.test(render(lines))) return false;
+
+  // `return { name = local }` is the lualib shape: named exports, not a default.
+  return exportNames.length === 0;
+}
+
 function computeDefaultAlias(moduleName: string, lines: Line[]): string | null {
   const text = render(lines);
 
-  if (!/____exports\.default\b/.test(text)) return null;
+  if (!/____exports\.default\b/.test(text) && !hasRawReturn(lines, exportTableNames(lines))) {
+    return null;
+  }
 
   return `____default_${sanitizeModuleName(moduleName)}`;
 }
@@ -358,6 +394,7 @@ function computeDefaultAlias(moduleName: string, lines: Line[]): string | null {
 /** Reads a module's imports, re-exports and top-level declarations. */
 function analyzeModule(name: string, raw: Line[], defaultAlias: string | null): Analysis {
   const requires = new Map<string, string>();
+  const dependencies: string[] = [];
   const importLocals = new Map<string, string>();
   const imports: ImportRef[] = [];
   const forwards = new Map<string, string>();
@@ -374,6 +411,12 @@ function analyzeModule(name: string, raw: Line[], defaultAlias: string | null): 
   };
 
   for (const line of raw) {
+    // Every require is an execution-order dependency: TSTL runs the required
+    // module before the code after the statement, even when nothing is bound.
+    const requiredModule = /require\("([^"]+)"\)/.exec(line.text);
+
+    if (requiredModule !== null) dependencies.push(requiredModule[1]);
+
     const requirement = REQUIRE_LINE.exec(line.text);
 
     if (requirement !== null) {
@@ -456,6 +499,15 @@ function analyzeModule(name: string, raw: Line[], defaultAlias: string | null): 
     exports.push({ name: entry.name, localName: entry.localName, canAssign: true });
   }
 
+  // A JSON module has no `____exports`; its whole return value is the default
+  // export. The importer still reads `.default`, so bind the return value under
+  // the module's default alias.
+  const rawReturn = defaultAlias !== null && hasRawReturn(raw, tableExports);
+
+  if (rawReturn && !exports.some((exported) => exported.name === "default")) {
+    exports.push({ name: "default", localName: defaultAlias, canAssign: true });
+  }
+
   // A name the module declares more than once cannot become an assignment to the
   // root local: the later declaration would still shadow it.
   for (const exported of exports) {
@@ -473,7 +525,19 @@ function analyzeModule(name: string, raw: Line[], defaultAlias: string | null): 
     }
   }
 
-  return { name, raw, defaultAlias, imports, importLocals, forwards, exports, topLocalCounts, topLocalLines };
+  return {
+    name,
+    raw,
+    defaultAlias,
+    imports,
+    dependencies,
+    importLocals,
+    forwards,
+    exports,
+    rawReturn,
+    topLocalCounts,
+    topLocalLines,
+  };
 }
 
 /** Follows re-export chains to the binding that actually defines the value. */
@@ -528,6 +592,7 @@ function resolveImports(
   resolve: (modulePath: string, exportName: string) => BindingSlot | undefined,
   bundled: Set<string>,
   defaultAliases: Map<string, string | null>,
+  lateAliases: Map<string, LateAlias>,
 ): { lines: Line[]; rewritten: Set<Line> } {
   const result: Line[] = [];
   const rewritten = new Set<Line>();
@@ -556,6 +621,14 @@ function resolveImports(
     }
 
     const slot = resolve(entry.modulePath, entry.exportName);
+
+    // A cyclic dependency cannot be ordered so its provider runs first. Its
+    // alias lives at root scope instead, and the provider fills it when it
+    // runs; dropping the per-module copy keeps later reads looking at the
+    // final value rather than a nil captured at module entry. Only drop the
+    // import when it resolves to the same binding the alias stands for: another
+    // module may use the same local name for an unrelated export.
+    if (slot !== undefined && lateAliases.get(localName)?.slot === slot) continue;
 
     if (slot !== undefined) {
       if (slot.name === localName) continue;
@@ -614,6 +687,19 @@ function isAssignableDeclaration(line: Line, names: Set<string>): boolean {
   return match !== null && names.has(match[1]);
 }
 
+/** Turns a raw module `return value` into the declaration of its default alias. */
+function assignRawReturn(lines: Line[], alias: string | null): Line[] {
+  if (alias === null) return lines;
+
+  const index = moduleReturnIndex(lines);
+
+  if (index === -1 || !/^return[ \t]+/.test(lines[index].text)) return lines;
+
+  return lines.map((line, at) =>
+    at === index ? { ...line, text: line.text.replace(/^return[ \t]+/, `local ${alias} = `) } : line,
+  );
+}
+
 function buildModuleBody(
   analysis: Analysis,
   assignable: Set<string>,
@@ -621,15 +707,23 @@ function buildModuleBody(
   bundled: Set<string>,
   defaultAliases: Map<string, string | null>,
   rootGlobals: Set<string>,
+  lateAliases: Map<string, LateAlias>,
 ): Line[] {
   const kept = analysis.raw.filter((line) => !isForwardedExport(analysis, line));
-  const { lines: imported, rewritten } = resolveImports({ ...analysis, raw: kept }, resolve, bundled, defaultAliases);
+  const { lines: imported, rewritten } = resolveImports(
+    { ...analysis, raw: kept },
+    resolve,
+    bundled,
+    defaultAliases,
+    lateAliases,
+  );
 
   const stripped = stripExports(imported, analysis.defaultAlias);
+  const withDefault = analysis.rawReturn ? assignRawReturn(stripped, analysis.defaultAlias) : stripped;
 
   // `local X = ...` becomes `X = ...`, which assigns the root local instead of
   // introducing a module-local that would shadow it.
-  const converted = stripped.map((line) => {
+  const converted = withDefault.map((line) => {
     if (rewritten.has(line) || !isAssignableDeclaration(line, assignable)) return line;
 
     return { ...line, text: line.text.slice("local ".length) };
@@ -705,6 +799,144 @@ function buildPlan(
   return { plan: planSlots(candidates, budget), forwardTargets };
 }
 
+/** The module part of a binding key. */
+function bindingOwner(key: string): string {
+  const separator = key.indexOf(BINDING_SEPARATOR);
+
+  return separator === -1 ? key : key.slice(0, separator);
+}
+
+/**
+ * Orders modules so a dependency's body runs before the bodies that read it.
+ *
+ * TSTL emits modules in source order and relies on `require` at the top of each
+ * module to run dependencies lazily, so bundle order says nothing about
+ * execution order. Once the runtime is gone, a module that runs before the one
+ * defining its imports captures nil.
+ *
+ * Tarjan's algorithm emits a component only after every component it depends on,
+ * so the result is dependency-first. Modules in a cycle keep their bundle order;
+ * the imports that cross the cycle are late-bound instead.
+ */
+function orderAnalyses(analyses: Analysis[]): { ordered: Analysis[]; componentOf: Map<string, number> } {
+  const byName = new Map(analyses.map((analysis) => [analysis.name, analysis]));
+  const bundleOrder = new Map(analyses.map((analysis, index) => [analysis.name, index]));
+  const edges = new Map(
+    analyses.map((analysis) => [analysis.name, analysis.dependencies.filter((dependency) => byName.has(dependency))]),
+  );
+
+  const index = new Map<string, number>();
+  const low = new Map<string, number>();
+  const onStack = new Set<string>();
+  const stack: string[] = [];
+  const components: string[][] = [];
+
+  let next = 0;
+
+  const connect = (name: string) => {
+    index.set(name, next);
+    low.set(name, next);
+    next += 1;
+    stack.push(name);
+    onStack.add(name);
+
+    for (const dependency of edges.get(name) ?? []) {
+      if (!index.has(dependency)) {
+        connect(dependency);
+        low.set(name, Math.min(low.get(name)!, low.get(dependency)!));
+      } else if (onStack.has(dependency)) {
+        low.set(name, Math.min(low.get(name)!, index.get(dependency)!));
+      }
+    }
+
+    if (low.get(name) !== index.get(name)) return;
+
+    const component: string[] = [];
+    let member: string;
+
+    do {
+      member = stack.pop()!;
+      onStack.delete(member);
+      component.push(member);
+    } while (member !== name);
+
+    components.push(component);
+  };
+
+  for (const analysis of analyses) {
+    if (!index.has(analysis.name)) connect(analysis.name);
+  }
+
+  const componentOf = new Map<string, number>();
+
+  for (const [position, component] of components.entries()) {
+    for (const name of component) componentOf.set(name, position);
+  }
+
+  const ordered = components.flatMap((component) =>
+    [...component]
+      .sort((left, right) => bundleOrder.get(left)! - bundleOrder.get(right)!)
+      .map((name) => byName.get(name)!),
+  );
+
+  return { ordered, componentOf };
+}
+
+interface LateAlias {
+  key: string;
+  owner: string;
+  slot: BindingSlot;
+}
+
+/**
+ * Import aliases that have to live at root scope because their binding is in
+ * the importer's dependency cycle. The provider assigns them when its body runs,
+ * so a consumer that only reads them later sees the final value.
+ */
+function planLateAliases(
+  analyses: Analysis[],
+  plan: SlotPlan,
+  forwardTargets: Map<string, string>,
+  componentOf: Map<string, number>,
+  reserved: Set<string>,
+): Map<string, LateAlias> {
+  const byAlias = new Map<string, LateAlias[]>();
+
+  for (const analysis of analyses) {
+    for (const entry of analysis.imports) {
+      const key = resolveBinding(bindingKey(entry.modulePath, entry.exportName), forwardTargets);
+      const slot = plan.slots.get(key);
+
+      // Same-name hot bindings already refer to the root local at every use,
+      // so there is nothing to defer.
+      if (slot === undefined || slot.name === entry.localName) continue;
+
+      const owner = bindingOwner(key);
+
+      if (componentOf.get(owner) === undefined || componentOf.get(owner) !== componentOf.get(analysis.name)) continue;
+
+      if (!isLuaIdentifier(entry.localName)) continue;
+
+      const aliases = byAlias.get(entry.localName) ?? [];
+      aliases.push({ key, owner, slot });
+      byAlias.set(entry.localName, aliases);
+    }
+  }
+
+  const late = new Map<string, LateAlias>();
+
+  for (const [alias, aliases] of byAlias) {
+    // One root local cannot stand for two different bindings, and it must not
+    // shadow an existing root binding.
+    if (new Set(aliases.map((candidate) => candidate.key)).size !== 1) continue;
+    if (reserved.has(alias)) continue;
+
+    late.set(alias, aliases[0]);
+  }
+
+  return late;
+}
+
 /** Wraps every module in its own function, hoisting only what is shared. */
 function flattenScoped(
   lines: Line[],
@@ -713,15 +945,32 @@ function flattenScoped(
   limit: number | false,
   rootGlobals: string[],
 ): FlattenResult {
-  const analyses = extracted.modules.map((module) =>
+  const analyzed = extracted.modules.map((module) =>
     analyzeModule(module.name, module.raw, computeDefaultAlias(module.name, module.raw)),
   );
+  const { ordered: analyses, componentOf } = orderAnalyses(analyzed);
 
   const { plan, forwardTargets } = buildPlan(analyses, budget);
 
   const rootGlobalNames = new Set(rootGlobals);
   const bundled = new Set(analyses.map((analysis) => analysis.name));
   const defaultAliases = new Map(analyses.map((analysis) => [analysis.name, analysis.defaultAlias]));
+
+  const reserved = new Set(plan.hot);
+
+  if (plan.table !== null) reserved.add(plan.table);
+
+  for (const name of rootGlobalNames) reserved.add(name);
+
+  const lateAliases = planLateAliases(analyses, plan, forwardTargets, componentOf, reserved);
+  const lateNames = new Set(lateAliases.keys());
+  const lateAssignments = new Map<string, { alias: string; source: string }[]>();
+
+  for (const [alias, late] of lateAliases) {
+    const assignments = lateAssignments.get(late.owner) ?? [];
+    assignments.push({ alias, source: late.slot.name });
+    lateAssignments.set(late.owner, assignments);
+  }
 
   const resolve = (modulePath: string, exportName: string): BindingSlot | undefined => {
     const key = resolveBinding(bindingKey(modulePath, exportName), forwardTargets);
@@ -760,6 +1009,7 @@ function flattenScoped(
       bundled,
       defaultAliases,
       rootGlobalNames,
+      lateAliases,
     ),
   );
 
@@ -768,7 +1018,13 @@ function flattenScoped(
   if (plan.hot.length > 0) result.push(inserted(`local ${plan.hot.join(", ")}`));
   if (plan.table !== null) result.push(inserted(`local ${plan.table} = {}`));
 
+  const lateNamesInOrder = [...lateNames];
+
+  if (lateNamesInOrder.length > 0) result.push(inserted(`local ${lateNamesInOrder.join(", ")}`));
+
   for (const [index, body] of bodies.entries()) {
+    const name = analyses[index].name;
+
     // Bodies are separated by a blank line, which nothing in the bundle owns.
     if (index > 0) result.push(inserted(""));
 
@@ -778,7 +1034,12 @@ function flattenScoped(
       continue;
     }
 
-    result.push(...wrapperLines(`____module_${index}`, body, publishes.get(analyses[index].name) ?? []));
+    result.push(...wrapperLines(`____module_${index}`, body, publishes.get(name) ?? []));
+
+    // Fill aliases bound to this module's exports now that its body has run.
+    for (const assignment of lateAssignments.get(name) ?? []) {
+      result.push(inserted(`${assignment.alias} = ${assignment.source}`));
+    }
   }
 
   // A listed name that is also a shared binding lives in a root local (or the
@@ -835,7 +1096,7 @@ function flattenScoped(
     hoisted: plan.slots.size,
     hot: plan.hot.length,
     cold: plan.cold,
-    rootLocals: plan.hot.length + (plan.table === null ? 0 : 1),
+    rootLocals: plan.hot.length + (plan.table === null ? 0 : 1) + lateNames.size,
     budget,
     limit,
     worst,

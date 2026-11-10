@@ -381,6 +381,115 @@ print(____not(true))`,
     expect(usages[0].budget).toBe(DEFAULT_REGISTER_BUDGET);
     expect(usages[0].limit).toBe(LUAU_REGISTER_LIMIT);
   });
+
+  test("runs a dependency before a module that appears earlier in the bundle", () => {
+    // TSTL emits modules in source order and relies on `require` to run
+    // dependencies lazily. Flattening removes that require, so the dependency
+    // has to be moved ahead of its consumer instead.
+    const code = bundle(
+      [
+        [
+          "src/b",
+          `local ____a = require("src/a")
+local b_value = ____a.value
+print(b_value)`,
+        ],
+        ["src/a", exports("____exports.value = 1")],
+      ],
+      "src/b",
+    );
+
+    const output = flattenBundle(code, []);
+
+    expect(rootLocals(output)).toEqual(["local value"]);
+    expect(output.indexOf("\nvalue = 1\n")).toBeLessThan(output.indexOf("\nlocal b_value = value\n"));
+  });
+
+  test("binds a JSON module's bare return as its default export", () => {
+    // TSTL emits JSON modules as `return <value>` with no `____exports`, while
+    // importers still read `.default`. The return value has to be named, or the
+    // import is dropped and every use becomes a nil global.
+    const code = bundle(
+      [
+        ["src/palettes.json", `return {\n    red = "#f00"\n}`],
+        [
+          "src/main",
+          `local ____palettes = require("src/palettes.json")
+local palettes = ____palettes.default
+print(palettes.red)`,
+        ],
+      ],
+      "src/main",
+    );
+
+    const output = flattenBundle(code, []);
+
+    expect(output).toMatch(/____default_\w+ = \{/);
+    expect(output).toContain('red = "#f00"');
+    expect(output).toContain("\nlocal palettes = ");
+    expect(output).toContain("print(palettes.red)");
+    expect(output).not.toContain("return {");
+  });
+
+  test("treats a return table of literals as JSON, not as named exports", () => {
+    const code = bundle(
+      [
+        ["src/flags.json", `return {\n    enabled = true,\n    missing = nil\n}`],
+        [
+          "src/main",
+          `local ____flags = require("src/flags.json")
+local flags = ____flags.default
+print(flags.enabled)`,
+        ],
+      ],
+      "src/main",
+    );
+
+    const output = flattenBundle(code, []);
+
+    expect(output).toMatch(/____default_\w+ = \{/);
+    expect(output).toContain("\nlocal flags = ");
+    expect(output).toContain("print(flags.enabled)");
+  });
+
+  test("late-binds imports that cross an import cycle", () => {
+    // No module order can put both providers first inside a cycle. The aliases
+    // live at root scope and the providers fill them after running, so a
+    // consumer that only reads them later sees the final value instead of a nil
+    // captured at module entry.
+    const code = bundle(
+      [
+        [
+          "src/a",
+          `local ____b = require("src/b")
+local b_value = ____b.value
+____exports.name = "a"
+____exports.read = function()
+    print(b_value)
+end`,
+        ],
+        [
+          "src/b",
+          `local ____a = require("src/a")
+local a_name = ____a.name
+____exports.value = 1
+print(a_name)`,
+        ],
+      ],
+      "src/a",
+    );
+
+    const output = flattenBundle(code, []);
+
+    // Both aliases are declared once at root scope, in bundle order.
+    expect(rootLocals(output).some((line) => line.includes("b_value") && line.includes("a_name"))).toBe(true);
+    expect(output).not.toContain("local b_value =");
+    expect(output).not.toContain("local a_name =");
+
+    // Each alias is filled right after the module that owns the binding runs.
+    expect(output.indexOf("\na_name = name\n")).toBeGreaterThan(output.indexOf("____module_0()"));
+    expect(output.indexOf("\nb_value = value\n")).toBeGreaterThan(output.indexOf("____module_1()"));
+  });
 });
 
 describe("root globals", () => {
